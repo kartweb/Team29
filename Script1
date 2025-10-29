@@ -1,0 +1,185 @@
+#
+# 📜 SCRIPT 1: MODEL TRAINING & SERIALIZATION
+#
+# PURPOSE: To fetch extensive historical data and train a SARIMAX model using a 
+#          "production-safe" feature engineering strategy that prevents data leakage.
+#          This ensures that the features used for training are the same as those
+#          available in a live prediction scenario.
+# USAGE:   Run this script once to generate the 'sarimax_model_with_features.pkl' file.
+#
+
+import pandas as pd
+import numpy as np
+import requests
+import time
+from entsoe import EntsoePandasClient
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# --- Configuration ---
+# ⚠️ IMPORTANT: Paste your personal ENTSO-E API key here.
+ENTSOE_API_KEY = "c4674c63-8780-42ef-bf6d-f2653b826312"
+MODEL_FILENAME = "C:/Users/diede/Downloads/sarimax_model_with_features.pkl"
+START_DATE = "2025-10-01"
+END_DATE = pd.to_datetime('today').strftime('%Y-%m-%d')
+
+def fetch_elia_data_paginated(api_url, start_date, end_date, is_minute_data=False):
+    """
+    Fetches data from an Elia API endpoint using pagination to get all records
+    within a specified date range.
+    """
+    all_records = []
+    
+    # Use a WHERE clause to filter by date server-side, which is much more efficient
+    where_clause = f"datetime >= date'{start_date}' and datetime < date'{end_date}'"
+    
+    params = {
+        "limit": 100,
+        "order_by": "datetime", # Fetch oldest first
+        "where": where_clause,
+        "offset": 0
+    }
+    
+    print(f"  - Fetching data from {api_url.split('/')[-2]}...")
+    while True:
+        response = requests.get(api_url, params=params)
+        response.raise_for_status()
+        records = response.json().get('results', [])
+        
+        if not records:
+            break # Stop if the API returns an empty page
+        
+        all_records.extend(records)
+        params['offset'] += len(records)
+        print(f"    > Fetched {len(all_records)} records...", end='\r')
+        time.sleep(0.1)
+        
+    print(f"\n  - Total records fetched: {len(all_records)}")
+    return pd.DataFrame(all_records)
+
+def create_modeling_dataframe():
+    """
+    Executes the full data engineering pipeline to create a feature-rich,
+    non-leaking DataFrame for model training.
+    """
+    print(f"--- Starting Data Engineering Pipeline (from {START_DATE} to {END_DATE}) ---")
+
+    # --- Step 1: Fetch All Historical Data ---
+    # Fetch Actual Imbalance (ODS134 - 15min resolution)
+    df_actual = fetch_elia_data_paginated(
+        "https://opendata.elia.be/api/explore/v2.1/catalog/datasets/ods134/records",
+        START_DATE, END_DATE
+    )
+    df_actual = df_actual[['datetime', 'imbalanceprice']]
+    df_actual.rename(columns={'imbalanceprice': 'actual_price'}, inplace=True)
+
+    # Fetch Forecasted Imbalance (ODS161 - 1min resolution)
+    df_forecast = fetch_elia_data_paginated(
+        "https://opendata.elia.be/api/explore/v2.1/catalog/datasets/ods161/records",
+        START_DATE, END_DATE, is_minute_data=True
+    )
+    df_forecast = df_forecast[['datetime', 'imbalanceprice']]
+    df_forecast.rename(columns={'imbalanceprice': 'forecast_price'}, inplace=True)
+    
+    # --- Step 2: Prepare and Resample Data ---
+    print("\n--- Step 2: Preparing and Resampling Data ---")
+    for df, name in [(df_actual, 'actual'), (df_forecast, 'forecast')]:
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df.set_index('datetime', inplace=True)
+        df.sort_index(inplace=True)
+
+    # Resample to ensure a clean 15-minute frequency for all datasets
+    df_actual = df_actual.resample('15min').mean()
+    df_forecast = df_forecast.resample('15min').mean()
+    print("  - Data resampled to 15-minute intervals.")
+
+    # --- Step 3: Fetch Supplementary API Data ---
+    print("\n--- Step 3: Fetching Supplementary Data (Weather & DAM) ---")
+    # Fetch ENTSO-E Day-Ahead Prices
+    client = EntsoePandasClient(api_key=ENTSOE_API_KEY)
+    start_ts = pd.Timestamp(START_DATE, tz='Europe/Brussels')
+    end_ts = pd.Timestamp(END_DATE, tz='Europe/Brussels')
+    prices = client.query_day_ahead_prices('BE', start=start_ts, end=end_ts)
+    df_dam = pd.DataFrame(prices, columns=['dam_price']).resample('15min').ffill()
+    df_dam.index = df_dam.index.tz_convert('UTC')
+    print("  - Fetched Day-Ahead Market prices.")
+
+    # Fetch Open-Meteo Weather Data
+    params = {"latitude": 50.85, "longitude": 4.35, "start_date": START_DATE, "end_date": END_DATE, "hourly": "temperature_2m,shortwave_radiation,windspeed_10m"}
+    response = requests.get("https://archive-api.open-meteo.com/v1/archive", params=params)
+    data = response.json()['hourly']
+    df_weather = pd.DataFrame(data)
+    df_weather['time'] = pd.to_datetime(df_weather['time']).dt.tz_localize('UTC')
+    df_weather.set_index('time', inplace=True)
+    df_weather = df_weather.resample('15min').ffill()
+    print("  - Fetched historical weather data.")
+
+    # --- Step 4: Merge and Clean ---
+    print("\n--- Step 4: Merging all data sources ---")
+    master_df = df_actual.join(df_forecast, how='left')
+    master_df = master_df.join(df_dam, how='left')
+    master_df = master_df.join(df_weather, how='left')
+    
+    master_df.interpolate(method='time', inplace=True)
+    master_df.fillna(method='ffill', inplace=True)
+    master_df.dropna(subset=['actual_price'], inplace=True) # Drop rows where the target is unknown
+    print("  - Merging complete.")
+
+    # --- Step 5: Production-Safe Feature Engineering ---
+    print("\n--- Step 5: Performing Production-Safe Feature Engineering ---")
+    
+    # Calendar features are always known
+    master_df['hour'] = master_df.index.hour
+    master_df['day_of_week'] = master_df.index.dayofweek
+    master_df['month'] = master_df.index.month
+    master_df['is_weekend'] = (master_df.index.dayofweek >= 5).astype(int)
+    
+    # Lag features of the target variable (starting from T-2)
+    for lag in [2, 3, 4, 97]: # 97 = 24 hours ago + 1 period shift
+        master_df[f'actual_price_lag_{lag}'] = master_df['actual_price'].shift(lag)
+        
+    # Rolling features of the target variable (starting from T-2)
+    for window in [4, 96]:
+        master_df[f'rolling_mean_{window}'] = master_df['actual_price'].shift(2).rolling(window=window).mean()
+        master_df[f'rolling_std_{window}'] = master_df['actual_price'].shift(2).rolling(window=window).std()
+
+    # The forecast price for the *previous* period is a valid and powerful feature
+    master_df['forecast_price'] = master_df['forecast_price'].shift(1)
+        
+    master_df.dropna(inplace=True)
+    print("  - Feature engineering complete.")
+    return master_df
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    if ENTSOE_API_KEY == "YOUR_API_KEY_HERE":
+        print("--- WARNING: ENTSO-E API key is missing. ---")
+    else:
+        # 1. Create the dataset
+        master_df = create_modeling_dataframe()
+        
+        if master_df is not None and not master_df.empty:
+            print(f"\n--- Final Dataset Shape for Training: {master_df.shape} ---")
+            
+            # 2. Define Target and Features
+            y = master_df['actual_price']
+            X = master_df.drop(columns=['actual_price'])
+            
+            print(f"  - Target (y) shape: {y.shape}")
+            print(f"  - Features (X) shape: {X.shape}")
+            print(f"  - Feature columns: {X.columns.tolist()}")
+
+            # 3. Train the SARIMAX Model
+            print("\n--- Training New SARIMAX Model (this may take several minutes) ---")
+            # A well-performing, standard order for such problems
+            model = SARIMAX(endog=y, exog=X, order=(2, 1, 2)) 
+            model_fit = model.fit(disp=False)
+            
+            print("\n--- Model Training Complete ---")
+            print(model_fit.summary())
+            
+            # 4. Save the Trained Model
+            model_fit.save(MODEL_FILENAME)
+            print(f"\n Model successfully saved to '{MODEL_FILENAME}'")
