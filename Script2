@@ -1,0 +1,202 @@
+#
+# 📜 SCRIPT 2: LIVE PREDICTION ENGINE 
+# PURPOSE: To load the newly trained model and generate live predictions using the
+#          exact same "production-safe" feature engineering.
+# USAGE:   Run this script after the NEW model has been trained and saved.
+#
+
+import pandas as pd
+import numpy as np
+import requests
+from entsoe import EntsoePandasClient
+from statsmodels.tsa.statespace.sarimax import SARIMAXResults
+from datetime import datetime, timedelta
+import time
+import os
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# --- Configuration ---
+# ⚠️ IMPORTANT: Paste your personal ENTSO-E API key here.
+MODEL_FILENAME = "C:/Users/diede/Downloads/sarimax_model_with_features.pkl"
+PREDICTION_LEAD_TIME_MINUTES = 3
+HISTORY_DAYS_FOR_FEATURES = 25 
+
+def create_live_feature_dataframe(history_days):
+    """
+    Pulls the most recent data from live APIs and generates features that
+    EXACTLY MATCH the new, production-safe training script.
+    """
+    print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] Pulling last {history_days} days of data for feature generation...")
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=history_days)
+    
+    try:
+        # --- Fetch ENTSO-E Day-Ahead Prices ---
+        print("  - Fetching day-ahead prices from ENTSO-E...")
+        client = EntsoePandasClient(api_key=ENTSOE_API_KEY)
+        start_ts = pd.Timestamp(start_date, tz='Europe/Brussels')
+        end_ts = pd.Timestamp(end_date, tz='Europe/Brussels')
+        prices = client.query_day_ahead_prices('BE', start=start_ts, end=end_ts)
+        df_dam = pd.DataFrame(prices, columns=['dam_price']).resample('15min').ffill()
+        df_dam.index = df_dam.index.tz_convert('UTC')
+
+        # --- Fetch Elia Actual Imbalance (ODS134) ---
+        print("  - Fetching latest ACTUAL imbalance prices from Elia API...")
+        elia_actual_api_url = "https://opendata.elia.be/api/explore/v2.1/catalog/datasets/ods134/records"
+        actual_records_needed = (history_days * 96) + 10
+        actual_all_records = []
+        actual_current_offset = 0
+        while len(actual_all_records) < actual_records_needed:
+            params = {"limit": 100, "order_by": "-datetime", "offset": actual_current_offset}
+            response = requests.get(elia_actual_api_url, params=params)
+            response.raise_for_status()
+            records = response.json().get('results', [])
+            if not records: break
+            actual_all_records.extend(records)
+            actual_current_offset += len(records)
+            time.sleep(0.1)
+        
+        df_actual = pd.DataFrame(actual_all_records)[['datetime', 'imbalanceprice']]
+        df_actual.rename(columns={'imbalanceprice': 'actual_price'}, inplace=True)
+        
+        # --- Fetch Elia Forecasted Imbalance (ODS161) ---
+        print("  - Fetching latest FORECASTED imbalance prices from Elia API...")
+        elia_forecast_api_url = "https://opendata.elia.be/api/explore/v2.1/catalog/datasets/ods161/records"
+        forecast_records_needed = (history_days * 96 * 2) # Fetch more, it's 1-min data
+        forecast_all_records = []
+        forecast_current_offset = 0
+        while len(forecast_all_records) < forecast_records_needed:
+            params = {"limit": 100, "order_by": "-datetime", "offset": forecast_current_offset}
+            response = requests.get(elia_forecast_api_url, params=params)
+            response.raise_for_status()
+            records = response.json().get('results', [])
+            if not records: break
+            forecast_all_records.extend(records)
+            forecast_current_offset += len(records)
+            time.sleep(0.1)
+            
+        df_forecast = pd.DataFrame(forecast_all_records)[['datetime', 'imbalanceprice']]
+        df_forecast.rename(columns={'imbalanceprice': 'forecast_price'}, inplace=True)
+
+        # --- Prepare and Resample Data ---
+        for df in [df_actual, df_forecast]:
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df.set_index('datetime', inplace=True)
+            df.sort_index(inplace=True)
+        
+        df_actual = df_actual.resample('15min').mean()
+        df_forecast = df_forecast.resample('15min').mean()
+
+        # --- Fetch Weather Data ---
+        print("  - Fetching weather data from Open-Meteo...")
+        params = {"latitude": 50.85, "longitude": 4.35, "start_date": start_date.strftime('%Y-%m-%d'), "end_date": end_date.strftime('%Y-%m-%d'), "hourly": "temperature_2m,shortwave_radiation,windspeed_10m"}
+        weather_response = requests.get("https://archive-api.open-meteo.com/v1/archive", params=params)
+        weather_response.raise_for_status()
+        df_weather = pd.DataFrame(weather_response.json()['hourly'])
+        df_weather['time'] = pd.to_datetime(df_weather['time']).dt.tz_localize('UTC')
+        df_weather.set_index('time', inplace=True)
+        df_weather = df_weather.resample('15min').ffill()
+
+        # --- Merge All DataFrames ---
+        print("  - Merging all data sources...")
+        master_df = df_actual.join(df_forecast, how='left')
+        master_df = master_df.join(df_dam, how='left')
+        master_df = master_df.join(df_weather, how='left')
+        
+        master_df.interpolate(method='time', inplace=True)
+        master_df.fillna(method='ffill', inplace=True)
+
+        master_df['hour'] = master_df.index.hour
+        master_df['day_of_week'] = master_df.index.dayofweek
+        master_df['month'] = master_df.index.month
+        master_df['is_weekend'] = (master_df.index.dayofweek >= 5).astype(int)
+
+        # Lags now start from shift(2) to prevent data leakage
+        for lag in [2, 3, 4, 97]: 
+            master_df[f'actual_price_lag_{lag}'] = master_df['actual_price'].shift(lag)
+        
+        # Rolling features are also based on shift(2)
+        for window in [4, 96]:
+            master_df[f'rolling_mean_{window}'] = master_df['actual_price'].shift(2).rolling(window=window).mean()
+            master_df[f'rolling_std_{window}'] = master_df['actual_price'].shift(2).rolling(window=window).std()
+            
+        # The forecast price for the previous period is a valid feature
+        master_df['forecast_price'] = master_df['forecast_price'].shift(1)
+        
+        master_df.dropna(inplace=True)
+        print("  - Feature generation complete.")
+        return master_df
+
+    except requests.exceptions.RequestException as e:
+        print(f"  - FATAL API ERROR: Could not connect to an API endpoint. Error: {e}")
+        return None
+    except Exception as e:
+        print(f"  - FATAL ERROR during live data pipeline: {e}")
+        return None
+
+def run_live_predictions():
+    """Main function to run the live prediction loop."""
+    print("--- Live Prediction Script Initialized ---")
+    try:
+        print(f"Loading pre-trained model from '{MODEL_FILENAME}'...")
+        loaded_model = SARIMAXResults.load(MODEL_FILENAME)
+        print("Model loaded successfully.")
+    except FileNotFoundError:
+        print(f"FATAL ERROR: Model file '{MODEL_FILENAME}' not found. Please run the new training script first.")
+        return
+
+    while True:
+        try:
+            now_utc = datetime.utcnow()
+            next_quarter_hour = now_utc.replace(second=0, microsecond=0) + timedelta(minutes=15 - now_utc.minute % 15)
+            prediction_deadline = next_quarter_hour - timedelta(minutes=PREDICTION_LEAD_TIME_MINUTES)
+            
+            sleep_seconds = (prediction_deadline - now_utc).total_seconds()
+            if sleep_seconds > 0:
+                print(f"\nNext prediction for quarter starting at {next_quarter_hour.strftime('%Y-%m-%d %H:%M:%S')} UTC.")
+                print(f"Sleeping for {sleep_seconds:.0f} seconds until {prediction_deadline.strftime('%H:%M:%S')} UTC...")
+                time.sleep(sleep_seconds)
+            
+            print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC] Waking up to generate prediction...")
+            features_df = create_live_feature_dataframe(history_days=HISTORY_DAYS_FOR_FEATURES)
+            
+            if features_df is None or features_df.empty:
+                print("Could not generate features. Skipping this cycle.")
+                time.sleep(60)
+                continue
+            
+            # The target variable is not available for prediction, so we drop it.
+            latest_features = features_df.drop(columns=['actual_price']).tail(1)
+            
+            print(f"  - Shape of features for model: {latest_features.shape}")
+            print("Forecasting price for the next quarter-hour...")
+            prediction = loaded_model.forecast(steps=1, exog=latest_features)
+            predicted_price = prediction.iloc[0]
+
+            target_start = next_quarter_hour
+            target_end = target_start + timedelta(minutes=15)
+            
+            print("\n" + "="*50)
+            print(">>> PREDICTION READY FOR SUBMISSION <<<")
+            print("="*50)
+            print(f"  Team Number: Goup 29")
+            print(f"  Quarter Hour:     {target_start.strftime('%Y-%m-%d %H:%M')}-{target_end.strftime('%H:%M')}")
+            print(f"  Predicted Price:  {predicted_price:.4f} EUR/MWh")
+            print("="*50)
+
+            time.sleep(61)
+
+        except Exception as e:
+            print(f"\nAn error occurred in the main loop: {e}")
+            print("Restarting loop in 60 seconds...")
+            time.sleep(60)
+
+if __name__ == "__main__":
+    if ENTSOE_API_KEY == "YOUR_API_KEY_HERE":
+        print("--- WARNING: ENTSO-E API key is missing. ---")
+    elif not os.path.exists(MODEL_FILENAME):
+         print(f"FATAL ERROR: Model file '{MODEL_FILENAME}' not found. Please run the new training script first.")
+    else:
+        run_live_predictions()
