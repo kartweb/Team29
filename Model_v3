@@ -1,0 +1,180 @@
+import pandas as pd
+import numpy as np
+import requests
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from entsoe import EntsoePandasClient
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# --- IMPORTANT: PASTE ENTSO-E API KEY HERE ---
+ENTSOE_API_KEY = "c4674c63-8780-42ef-bf6d-f2653b826312"
+
+# --- Main Data Preparation Function ---
+
+def create_production_safe_modeling_df():
+    """
+    Executes a data engineering pipeline with a production-safe
+    feature engineering strategy.
+    """
+    print("--- Starting Production-Safe Data Engineering Pipeline ---")
+
+    # Step 1: Load local CSV data
+    print("Step 1: Loading local CSV data...")
+    try:
+        imbalance_actual = pd.read_csv('C:/Users/diede/Downloads/imbalance_actual.csv')
+        imbalance_forecast = pd.read_csv('C:/Users/diede/Downloads/imbalance_forecast.csv')
+    except FileNotFoundError as e:
+        print(f"Error: A source CSV file was not found. Please check paths.\n{e}")
+        return None
+
+    def prepare_local_csv(df):
+        df['datetime_utc'] = pd.to_datetime(df['datetime_utc'])
+        df.set_index('datetime_utc', inplace=True)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize('UTC')
+        return df.resample('15min').mean(numeric_only=True)
+
+    df_actual = prepare_local_csv(imbalance_actual)
+    df_forecast = prepare_local_csv(imbalance_forecast)
+    
+    master_df = pd.concat([
+        df_actual['price_eur_mwh'].rename('actual_price'),
+        df_forecast['price_eur_mwh'].rename('forecast_price')
+    ], axis=1)
+
+    # Step 2: Pull API Data
+    print("Step 2: Pulling supplementary data from APIs...")
+    start_date = master_df.index.min().strftime('%Y-%m-%d')
+    end_date = master_df.index.max().strftime('%Y-%m-%d')
+
+    try:
+        client = EntsoePandasClient(api_key=ENTSOE_API_KEY)
+        start_ts = pd.Timestamp(start_date, tz='Europe/Brussels')
+        end_ts = pd.Timestamp(end_date, tz='Europe/Brussels')
+        prices = client.query_day_ahead_prices('BE', start=start_ts, end=end_ts)
+        df_dam = pd.DataFrame(prices, columns=['dam_price'])
+        df_dam.index = df_dam.index.tz_convert('UTC')
+        df_dam = df_dam.resample('15min').ffill()
+    except Exception as e:
+        print(f"  - WARNING: Failed to fetch ENTSO-E data. Error: {e}")
+        df_dam = None
+
+    params = {"latitude": 50.85, "longitude": 4.35, "start_date": start_date, "end_date": end_date, "hourly": "temperature_2m,shortwave_radiation,windspeed_10m"}
+    response = requests.get("https://archive-api.open-meteo.com/v1/archive", params=params)
+    if response.status_code == 200:
+        data = response.json()['hourly']
+        df_weather = pd.DataFrame(data)
+        df_weather['time'] = pd.to_datetime(df_weather['time']).dt.tz_localize('UTC')
+        df_weather.set_index('time', inplace=True)
+        df_weather = df_weather.resample('15min').ffill()
+    else:
+        print("  - WARNING: Failed to fetch weather data.")
+        df_weather = None
+
+    # Step 3: Merge all data sources
+    print("Step 3: Merging all data sources...")
+    if df_dam is not None:
+        master_df = master_df.join(df_dam, how='left')
+    if df_weather is not None:
+        master_df = master_df.join(df_weather, how='left')
+        
+    master_df.interpolate(method='time', inplace=True)
+    master_df.fillna(method='ffill', inplace=True)
+
+    # --- Step 4: Production-Safe Feature Engineering ---
+    print("Step 4: Engineering features...")
+
+    # Calendar features are always safe as they are known in advance.
+    master_df['hour'] = master_df.index.hour
+    master_df['day_of_week'] = master_df.index.dayofweek
+    master_df['month'] = master_df.index.month
+    master_df['is_weekend'] = (master_df.index.dayofweek >= 5).astype(int)
+
+    # Elia's forecast for the previous period is a valid feature.
+    master_df['forecast_price_shifted_1'] = master_df['forecast_price'].shift(1)
+
+    
+    # Lag features now start from a safe point in the past (30+ minutes ago)
+    for lag in [2, 3, 4, 97]: # 97 = (24h * 4 quarters/hr) + 1 period shift
+        master_df[f'actual_price_lag_{lag}'] = master_df['actual_price'].shift(lag)
+    
+    # Rolling window features are calculated on data shifted by 2 periods.
+    for window in [4, 96]: # 1 hour, 24 hours
+        shifted_series = master_df['actual_price'].shift(2)
+        master_df[f'rolling_mean_{window}'] = shifted_series.rolling(window=window).mean()
+        master_df[f'rolling_std_{window}'] = shifted_series.rolling(window=window).std()
+    
+    # Drop rows at the beginning that have NaN values due to shifting
+    master_df.dropna(inplace=True)
+    
+    print("--- Data Engineering Pipeline Complete ---\n")
+    return master_df
+
+# --- Execute the Data Pipeline ---
+if ENTSOE_API_KEY == "YOUR_API_KEY_HERE" or not ENTSOE_API_KEY:
+    print("--- WARNING: ENTSO-E API key is missing. ---")
+    master_df = None
+else:
+    # This will now create a dataframe with robust features
+    master_df = create_production_safe_modeling_df()
+
+
+if master_df is not None and not master_df.empty:
+    print(f"Successfully created a production-safe dataframe with shape: {master_df.shape}")
+    print("\nFeature columns:")
+    print(master_df.drop(columns=['actual_price', 'forecast_price']).columns.tolist())
+
+
+
+
+
+
+
+
+
+
+# --- MODEL TRAINING AND PERFORMANCE ANALYSIS ---
+if master_df is not None and not master_df.empty:
+    
+    # Define Target and Features
+    y = master_df['actual_price']
+    X = master_df.drop(columns=['actual_price'])
+
+    # Create Chronological Train-Test Split
+    test_size = 672  # Last 7 days
+    y_train, y_test = y.iloc[:-test_size], y.iloc[-test_size:]
+    X_train, X_test = X.iloc[:-test_size], X.iloc[-test_size:]
+    print(f"--- Data Split Complete: Training on {len(y_train)} records, Testing on {len(y_test)} records ---\n")
+
+    # Train the SARIMAX Model
+    print("--- Training SARIMAX Model ---")
+    model = SARIMAX(endog=y_train, exog=X_train, order=(2, 1, 1), seasonal_order=(0, 0, 0, 0))
+    model_fit = model.fit(disp=False)
+    print("Model training complete.")
+    print(model_fit.summary())
+
+    # Make Predictions
+    print("\n--- Making Predictions on Test Set ---")
+    predictions = model_fit.forecast(steps=len(y_test), exog=X_test)
+
+    # Performance Analysis
+    mae = mean_absolute_error(y_test, predictions)
+    rmse = np.sqrt(mean_squared_error(y_test, predictions))
+    
+    print("\n--- Model Performance Metrics ---")
+    print(f"Mean Absolute Error (MAE):       {mae:.2f} EUR/MWh")
+    print(f"Root Mean Squared Error (RMSE):  {rmse:.2f} EUR/MWh")
+    print("---------------------------------")
+
+    # Visualization
+    plt.style.use('seaborn-v0_8-whitegrid')
+    plt.figure(figsize=(15, 7))
+    plt.plot(y_test.index, y_test, label='Actual Prices', color='blue')
+    plt.plot(predictions.index, predictions, label='SARIMAX Predictions', color='red', linestyle='--')
+    plt.title('Forecast vs. Actual Prices on Test Set', fontsize=16)
+    plt.xlabel('Time (UTC)'); plt.ylabel('Price (€/MWh)'); plt.legend()
+    plt.show()
